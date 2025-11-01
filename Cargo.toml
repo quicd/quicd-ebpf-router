@@ -2,10 +2,10 @@
 resolver = "2"
 members = [
     "quicd-ebpf-router",
-    "quicd-ebpf-router-common",
-    "quicd-ebpf-router-ebpf",
+    "common",
+    "ebpf",
 ]
-default-members = ["quicd-ebpf-router", "quicd-ebpf-router-common"]
+default-members = ["quicd-ebpf-router", "common"]
 
 [workspace.package]
 license = "MIT OR Apache-2.0"
@@ -30,6 +30,6 @@ log = { version = "0.4.22", default-features = false }
 tokio = { version = "1.40.0", default-features = false }
 which = { version = "6.0.0", default-features = false }
 
-[profile.release.package.quicd-ebpf-router-ebpf]
+[profile.release.package.ebpf]
 debug = 2
 codegen-units = 1

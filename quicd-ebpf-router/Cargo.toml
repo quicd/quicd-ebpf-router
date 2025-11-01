@@ -6,21 +6,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-quicd-ebpf-router-common = { path = "../quicd-ebpf-router-common", features = ["user"] }
+common = { path = "../common", features = ["user"] }
 
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
-aya-log = { workspace = true }
-env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
-tokio = { workspace = true, features = [
-    "macros",
-    "rt",
-    "rt-multi-thread",
-    "net",
-    "signal",
-] }
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
@@ -37,8 +28,7 @@ cargo_metadata = { workspace = true }
 # Finally note that *any* usage of `artifact = ...` in *any* Cargo.toml in the workspace breaks
 # workflows with stable cargo; stable cargo outright refuses to load manifests that use unstable
 # features.
-quicd-ebpf-router-ebpf = { path = "../quicd-ebpf-router-ebpf" }
+ebpf = { path = "../ebpf" }
 
-[[bin]]
-name = "quicd-ebpf-router"
-path = "src/main.rs"
+[lib]
+path = "src/lib.rs"

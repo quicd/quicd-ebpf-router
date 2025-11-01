@@ -8,8 +8,8 @@ fn main() -> anyhow::Result<()> {
         .context("MetadataCommand::exec")?;
     let ebpf_package = packages
         .into_iter()
-        .find(|cargo_metadata::Package { name, .. }| name.as_str() == "quicd-ebpf-router-ebpf")
-        .ok_or_else(|| anyhow!("quicd-ebpf-router-ebpf package not found"))?;
+        .find(|cargo_metadata::Package { name, .. }| name.as_str() == "ebpf")
+        .ok_or_else(|| anyhow!("ebpf package not found"))?;
     let cargo_metadata::Package {
         name,
         manifest_path,

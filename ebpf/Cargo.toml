@@ -1,10 +1,10 @@
 [package]
-name = "quicd-ebpf-router-ebpf"
+name = "ebpf"
 version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-quicd-ebpf-router-common = { path = "../quicd-ebpf-router-common" }
+common = { path = "../common" }
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
