@@ -25,9 +25,8 @@ fn try_quicd_ebpf_router(ctx: SkMsgContext) -> Result<u32, u32> {
     let cookie = match extract_cookie(&ctx) {
         Some(c) => c,
         None => {
-            info!(&ctx, "failed to extract cookie, distributing load");
-            // No cookie found, distribute load evenly using DCID hash
-            return distribute_load(&ctx);
+            info!(&ctx, "failed to extract cookie, passing through");
+            return Ok(0); // SK_PASS
         }
     };
 
@@ -38,9 +37,8 @@ fn try_quicd_ebpf_router(ctx: SkMsgContext) -> Result<u32, u32> {
     let sum = generation + idx;
     
     if chksum != (sum & 0x7) {
-        info!(&ctx, "invalid cookie checksum, distributing load");
-        // Invalid cookie, distribute load evenly
-        return distribute_load(&ctx);
+        info!(&ctx, "invalid cookie checksum, passing through");
+        return Ok(0); // SK_PASS
     }
 
     info!(&ctx, "valid cookie found: {}, redirecting", cookie);
@@ -49,106 +47,12 @@ fn try_quicd_ebpf_router(ctx: SkMsgContext) -> Result<u32, u32> {
     let ret = QUICD_WORKERS.redirect_msg(&ctx, cookie, 0);
 
     if ret < 0 {
-        info!(&ctx, "redirect failed, distributing load");
-        // Redirect failed, fall back to load distribution
-        return distribute_load(&ctx);
+        info!(&ctx, "redirect failed, passing through");
+        Ok(0) // SK_PASS
     } else {
         Ok(ret as u32) // SK_REDIRECT
     }
 }
-
-/// Distribute load evenly among available sockets when no valid route is found
-/// Uses a simple hash of the DCID to ensure consistent routing for the same connection
-fn distribute_load(ctx: &SkMsgContext) -> Result<u32, u32> {
-    let dcid_hash = match compute_dcid_hash(ctx) {
-        Some(hash) => hash,
-        None => {
-            info!(ctx, "failed to compute DCID hash, passing through");
-            return Ok(0); // SK_PASS
-        }
-    };
-
-    // Use the hash to select a socket index (0-255 range)
-    // This ensures the same DCID always goes to the same worker
-    let socket_idx = (dcid_hash % 256) as u16;
-
-    info!(ctx, "distributing to socket index: {}", socket_idx);
-
-    let ret = QUICD_WORKERS.redirect_msg(ctx, socket_idx, 0);
-
-    if ret < 0 {
-        info!(ctx, "load distribution redirect failed, passing through");
-        Ok(0) // SK_PASS if redirect failed
-    } else {
-        Ok(ret as u32) // SK_REDIRECT
-    }
-}
-
-/// Compute a simple hash of the DCID for load distribution
-fn compute_dcid_hash(ctx: &SkMsgContext) -> Option<u32> {
-    let data = ctx.data() as *const u8;
-    let data_end = ctx.data_end() as *const u8;
-
-    // Need at least 1 byte
-    if unsafe { data.add(1) } > data_end {
-        return None;
-    }
-
-    // Read first byte to determine packet type
-    let first_byte = unsafe { *data };
-
-    if first_byte & 0x80 == 0 {
-        // Short header packet: DCID starts at offset 1, always 8 bytes
-        if unsafe { data.add(1 + 8) } > data_end {
-            return None;
-        }
-
-        // Hash the 8-byte DCID
-        let dcid_start = unsafe { data.add(1) };
-        let mut hash: u32 = 0;
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(0) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(1) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(2) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(3) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(4) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(5) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(6) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(7) } as u32);
-        Some(hash)
-    } else {
-        // Long header packet: DCID starts after version + dcid_len byte
-        if unsafe { data.add(6) } > data_end {
-            return None;
-        }
-
-        // Read DCID length (byte 5)
-        let dcid_len = unsafe { *data.add(5) } as usize;
-
-        if dcid_len != 8 {
-            return None;
-        }
-
-        // Check bounds for 8-byte DCID
-        if unsafe { data.add(6 + 8) } > data_end {
-            return None;
-        }
-
-        // Hash the 8-byte DCID
-        let dcid_start = unsafe { data.add(6) };
-        let mut hash: u32 = 0;
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(0) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(1) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(2) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(3) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(4) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(5) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(6) } as u32);
-        hash = hash.wrapping_add(unsafe { *dcid_start.add(7) } as u32);
-        Some(hash)
-    }
-}
-
-/// Extract the 16-bit cookie from the QUIC connection ID (DCID)
 fn extract_cookie(ctx: &SkMsgContext) -> Option<u16> {
     let data = ctx.data() as *const u8;
     let data_end = ctx.data_end() as *const u8;
