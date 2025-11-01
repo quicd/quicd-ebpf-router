@@ -416,7 +416,7 @@ mod integration_tests {
         let new_connection_cid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]; // Random DCID
         assert!(!ConnectionId::validate_cookie(&new_connection_cid));
 
-        println!("✓ eBPF cookie routing logic validation passed");
+        println!("eBPF cookie routing logic validation passed");
     }
 
     #[test]
@@ -454,7 +454,7 @@ mod integration_tests {
         assert_eq!(extracted_cookie_long, Some(Cookie::generate(generation, worker_idx)));
         assert!(extracted_cookie_long.map_or(false, |c| Cookie::validate(c)));
 
-        println!("✓ QUIC packet parsing validation passed");
+        println!("QUIC packet parsing validation passed");
     }
 
     #[test]
@@ -484,7 +484,7 @@ mod integration_tests {
         // At least 2 out of 3 should be different (allowing for hash collisions)
         assert!(unique_hashes.len() >= 2, "Load distribution should spread connections");
 
-        println!("✓ Load distribution hash validation passed");
+        println!("Load distribution hash validation passed");
     }
 
     #[test]
@@ -509,7 +509,7 @@ mod integration_tests {
         let cookie_wrap = Cookie::generate(32, worker_idx); // Should wrap to 0
         assert_eq!(Cookie::get_generation(cookie_wrap), 0);
 
-        println!("✓ Cookie rotation validation passed");
+        println!("Cookie rotation validation passed");
     }
 }
 
