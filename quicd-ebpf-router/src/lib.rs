@@ -1,13 +1,117 @@
-use aya::{maps::SockHash, programs::SkMsg};
+use aya::{
+    maps::{MapData, SockHash},
+    programs::SkMsg,
+};
 use common::SockKey;
 #[rustfmt::skip]
 use log::debug;
+use std::os::fd::AsRawFd;
 
 // Re-export Cookie utilities for applications
 pub use common::Cookie;
 
 /// Standard Connection ID length used by this router (8 bytes)
 pub const CID_LENGTH: usize = 8;
+
+const WORKER_MAP_NAME: &str = "QUICD_WORKERS";
+const ROUTER_PROGRAM_NAME: &str = "quicd_ebpf_router";
+
+/// High-level interface for managing the QUIC router eBPF program and worker sockets
+///
+/// This type wraps the lifecycle of the userspace eBPF loader, exposes helpers for
+/// registering sockets, and allows applications to interact with the underlying
+/// worker map if they need custom behaviour.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::net::UdpSocket;
+/// use quicd_ebpf_router::{Router, ConnectionId};
+///
+/// fn main() -> anyhow::Result<()> {
+///     // Initialise logging/rlimits and load the eBPF router program
+///     let mut router = Router::new()?;
+///
+///     // Prepare a worker socket which should receive QUIC packets
+///     let socket = UdpSocket::bind("127.0.0.1:0")?;
+///
+///     // Register the socket by generation/worker index
+///     let cookie = router.register_worker_socket(0, 1, &socket)?;
+///
+///     // Use the cookie when building connection IDs for clients
+///     let cid = ConnectionId::new_with_seed(0, 1, 0x1234_5678);
+///     assert_eq!(ConnectionId::extract_cookie(&cid), Some(cookie));
+///
+///     Ok(())
+/// }
+/// ```
+pub struct Router {
+    ebpf: aya::Ebpf,
+    sock_map: SockHash<MapData, SockKey>,
+}
+
+impl Router {
+    /// Load the eBPF program, attach it, and return a router ready for socket registration
+    pub fn new() -> anyhow::Result<Self> {
+        setup_rlimit()?;
+        let ebpf = load_ebpf()?;
+        Self::from_loaded_ebpf(ebpf)
+    }
+
+    /// Build a router from a pre-loaded eBPF object
+    pub fn from_loaded_ebpf(mut ebpf: aya::Ebpf) -> anyhow::Result<Self> {
+        let sock_map: SockHash<_, SockKey> = ebpf
+            .take_map(WORKER_MAP_NAME)
+            .ok_or_else(|| anyhow::anyhow!("map '{}' not found", WORKER_MAP_NAME))?
+            .try_into()?;
+
+        let map_fd = sock_map.fd().try_clone()?;
+
+        let prog: &mut SkMsg = ebpf
+            .program_mut(ROUTER_PROGRAM_NAME)
+            .ok_or_else(|| anyhow::anyhow!("program '{}' not found", ROUTER_PROGRAM_NAME))?
+            .try_into()?;
+        prog.load()?;
+        prog.attach(&map_fd)?;
+
+        Ok(Self { ebpf, sock_map })
+    }
+
+    /// Insert a socket file descriptor keyed by a precomputed cookie
+    pub fn insert_socket<S: AsRawFd>(&mut self, cookie: SockKey, socket: &S) -> anyhow::Result<()> {
+        let fd = socket.as_raw_fd();
+        self.sock_map.insert(&cookie, fd, 0)?;
+        Ok(())
+    }
+
+    /// Convenience helper to compute the cookie and insert the socket in one step
+    pub fn register_worker_socket<S: AsRawFd>(
+        &mut self,
+        generation: u8,
+        worker_idx: u8,
+        socket: &S,
+    ) -> anyhow::Result<u16> {
+        let cookie = Cookie::generate(generation, worker_idx);
+        self.insert_socket(cookie, socket)?;
+        Ok(cookie)
+    }
+
+    /// Remove a socket entry from the routing map
+    pub fn remove_socket(&mut self, cookie: SockKey) -> anyhow::Result<()> {
+        self.sock_map.remove(&cookie)?;
+        Ok(())
+    }
+
+    /// Borrow the underlying socket map for advanced manipulations
+    pub fn sock_map(&mut self) -> &mut SockHash<MapData, SockKey> {
+        &mut self.sock_map
+    }
+
+    /// Access the underlying eBPF object for custom configuration
+    pub fn ebpf(&mut self) -> &mut aya::Ebpf {
+        &mut self.ebpf
+    }
+}
 
 /// Helper struct for working with QUIC Connection IDs
 ///
@@ -202,18 +306,6 @@ pub fn load_ebpf() -> anyhow::Result<aya::Ebpf> {
     )))?)
 }
 
-pub fn attach_program(ebpf: &mut aya::Ebpf) -> anyhow::Result<()> {
-    let sock_map: SockHash<_, SockKey> = ebpf.map("QUICD_WORKERS").unwrap().try_into()?;
-    let map_fd = sock_map.fd().try_clone()?;
-    let prog: &mut SkMsg = ebpf.program_mut("quicd_ebpf_router").unwrap().try_into()?;
-    prog.load()?;
-    prog.attach(&map_fd)?;
-    // Insert sockets to the map using sock_map.insert(cookie, socket_fd) here,
-    // or from a sock_ops program. The cookie value should match the one embedded
-    // in the QUIC connection ID (bytes 6-7).
-    Ok(())
-}
-
 /// Get the expected cookie for a worker
 /// Useful for debugging and verification
 pub fn get_worker_cookie(generation: u8, worker_idx: u8) -> u16 {
@@ -362,9 +454,7 @@ mod integration_tests {
     #[test]
     fn test_ebpf_cookie_routing() {
         // Setup eBPF program
-        setup_rlimit().expect("Failed to setup rlimit");
-        let mut ebpf = load_ebpf().expect("Failed to load eBPF");
-        attach_program(&mut ebpf).expect("Failed to attach program");
+        let _router = Router::new().expect("Failed to initialise router");
 
         let generation = 0;
 
