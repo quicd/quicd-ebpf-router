@@ -233,7 +233,11 @@ impl ConnectionId {
     /// let cid = ConnectionId::generate_with_entropy(0, 42, entropy);
     /// assert_eq!(cid.len(), 20);
     /// ```
-    pub fn generate_with_entropy(generation: u8, worker_idx: u8, entropy: [u8; 17]) -> [u8; CID_LENGTH] {
+    pub fn generate_with_entropy(
+        generation: u8,
+        worker_idx: u8,
+        entropy: [u8; 17],
+    ) -> [u8; CID_LENGTH] {
         let cookie = Cookie::generate(generation, worker_idx);
         let cookie_bytes = cookie.to_be_bytes();
 
