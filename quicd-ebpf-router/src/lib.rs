@@ -6,12 +6,14 @@ use common::SockKey;
 #[rustfmt::skip]
 use log::debug;
 use std::os::fd::AsRawFd;
+use siphasher::sip::SipHasher13;
+use std::hash::Hasher;
 
 // Re-export Cookie utilities for applications
 pub use common::Cookie;
 
-/// Standard Connection ID length used by this router (8 bytes)
-pub const CID_LENGTH: usize = 8;
+/// Standard Connection ID length used by this router (20 bytes)
+pub const CID_LENGTH: usize = 20;
 
 const WORKER_MAP_NAME: &str = "QUICD_WORKERS";
 const ROUTER_PROGRAM_NAME: &str = "quicd_ebpf_router";
@@ -38,9 +40,10 @@ const ROUTER_PROGRAM_NAME: &str = "quicd_ebpf_router";
 ///     // Register the socket by generation/worker index
 ///     let cookie = router.register_worker_socket(0, 1, &socket)?;
 ///
-///     // Use the cookie when building connection IDs for clients
-///     let cid = ConnectionId::new_with_seed(0, 1, 0x1234_5678);
+///     // Use the cookie when building 20-byte connection IDs for clients
+///     let cid = ConnectionId::new(0, 1)?; // Recommended: uses secure randomness
 ///     assert_eq!(ConnectionId::extract_cookie(&cid), Some(cookie));
+///     assert!(ConnectionId::verify_protection(&cid));
 ///
 ///     Ok(())
 /// }
@@ -128,9 +131,18 @@ impl Router {
 /// 4. **Client adopts SCID** - Client uses server's SCID as DCID in subsequent packets
 /// 5. **eBPF routes packets** - eBPF extracts cookie from DCID and redirects to correct socket
 ///
+/// # 20-byte Connection ID Format
+///
+/// - Bytes 0-5: Random prefix (6 bytes)
+/// - Bytes 6-7: Routing cookie (u16 big-endian)
+/// - Bytes 8-18: Random entropy (11 bytes)
+/// - Byte 19: Protection byte (SipHash-1-3 LSB over bytes 0-18)
+///
+/// Total entropy: 136 bits → safe for >100M concurrent connections
+///
 /// # Cookie Format
 ///
-/// The 16-bit cookie is embedded in bytes 6-7 of the 8-byte Connection ID:
+/// The 16-bit cookie is embedded in bytes 6-7 of the 20-byte Connection ID:
 /// - Bits 11-15 (5 bits): Generation counter (allows rotation)
 /// - Bits 3-10 (8 bits): Worker/socket index (0-255)
 /// - Bits 0-2 (3 bits): Checksum for validation
@@ -144,13 +156,15 @@ impl Router {
 /// let worker_idx = 42u8; // This socket's worker index
 /// let generation = 0u8;   // Current generation (can increment over time)
 ///
-/// // Option 1: Use a proper random number generator for the prefix
-/// let mut random_prefix = [0u8; 6];
-/// // Fill random_prefix with secure random bytes (e.g., from rand crate)
-/// let server_cid = ConnectionId::generate(generation, worker_idx, random_prefix);
+/// // Option 1: Fully automatic generation (recommended for production)
+/// let server_cid = ConnectionId::new(generation, worker_idx).unwrap();
 ///
-/// // Option 2: Use the simple seed-based method (less secure)
-/// let prefix_seed = 0x12345678u32; // Could be derived from timestamp, etc.
+/// // Option 2: Bring-your-own randomness (for testing or custom entropy)
+/// let entropy = [0u8; 17]; // 6 bytes prefix + 11 bytes suffix
+/// let server_cid = ConnectionId::new_with_entropy(generation, worker_idx, entropy);
+///
+/// // Option 3: Seeded generation (for tests only)
+/// let prefix_seed = 0x12345678u32;
 /// let server_cid = ConnectionId::new_with_seed(generation, worker_idx, prefix_seed);
 ///
 /// // Use server_cid as SCID in the Server Initial packet
@@ -167,67 +181,126 @@ impl Router {
 /// ```
 pub struct ConnectionId;
 
+// SipHash key for CID protection (can be rotated for additional security)
+const SIPHASH_KEY: (u64, u64) = (0x0706050403020100, 0x0f0e0d0c0b0a0908);
+
 impl ConnectionId {
-    /// Generate a new 8-byte Connection ID with an embedded cookie
+    /// Generate a new 20-byte Connection ID with automatic randomness (recommended)
     ///
-    /// The cookie is embedded in bytes 6-7 (big-endian u16).
-    /// Bytes 0-5 can be random or application-specific data.
+    /// This is the recommended method for production use. It:
+    /// - Fills bytes 0-5 and 8-18 with cryptographically secure random data
+    /// - Writes the routing cookie to bytes 6-7
+    /// - Computes SipHash-1-3 over bytes 0-18 and writes LSB to byte 19
     ///
     /// # Arguments
     /// * `generation` - Generation counter (0-31)
     /// * `worker_idx` - Worker/socket index (0-255)
-    /// * `random_prefix` - 6 bytes of random or application data for bytes 0-5
     ///
     /// # Returns
-    /// An 8-byte array representing the Connection ID
+    /// A 20-byte array representing the Connection ID, or an error if randomness fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// use quicd_ebpf_router::ConnectionId;
+    ///
+    /// let cid = ConnectionId::new(0, 42).unwrap();
+    /// assert_eq!(cid.len(), 20);
+    /// ```
+    pub fn new(generation: u8, worker_idx: u8) -> Result<[u8; CID_LENGTH], getrandom::Error> {
+        let mut entropy = [0u8; 17];
+        getrandom::getrandom(&mut entropy)?;
+        Ok(Self::new_with_entropy(generation, worker_idx, entropy))
+    }
+
+    /// Generate a new 20-byte Connection ID with provided entropy
+    ///
+    /// Use this method when you want to provide your own randomness source.
+    /// The entropy is split into prefix (6 bytes) and suffix (11 bytes).
+    ///
+    /// # Arguments
+    /// * `generation` - Generation counter (0-31)
+    /// * `worker_idx` - Worker/socket index (0-255)
+    /// * `entropy` - 17 bytes of random data (6 for prefix, 11 for suffix)
+    ///
+    /// # Returns
+    /// A 20-byte array representing the Connection ID
     ///
     /// # Example
     /// ```
     /// use quicd_ebpf_router::ConnectionId;
     ///
-    /// // Generate random prefix (in real code, use a CSPRNG)
-    /// let random_prefix = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
-    /// let cid = ConnectionId::generate(0, 42, random_prefix);
-    ///
-    /// // This CID can now be used as SCID in server Initial packet
-    /// // Client will echo it back as DCID, allowing eBPF routing
+    /// let entropy = [0xAAu8; 17]; // In production, use real random data
+    /// let cid = ConnectionId::new_with_entropy(0, 42, entropy);
+    /// assert_eq!(cid.len(), 20);
     /// ```
-    pub fn generate(generation: u8, worker_idx: u8, random_prefix: [u8; 6]) -> [u8; CID_LENGTH] {
+    pub fn new_with_entropy(generation: u8, worker_idx: u8, entropy: [u8; 17]) -> [u8; CID_LENGTH] {
         let cookie = Cookie::generate(generation, worker_idx);
         let cookie_bytes = cookie.to_be_bytes();
 
         let mut cid = [0u8; CID_LENGTH];
-        cid[0..6].copy_from_slice(&random_prefix);
+        
+        // Bytes 0-5: Random prefix from entropy
+        cid[0..6].copy_from_slice(&entropy[0..6]);
+        
+        // Bytes 6-7: Routing cookie
         cid[6..8].copy_from_slice(&cookie_bytes);
+        
+        // Bytes 8-18: Random entropy (11 bytes)
+        cid[8..19].copy_from_slice(&entropy[6..17]);
+        
+        // Byte 19: SipHash-1-3 protection byte
+        let mut hasher = SipHasher13::new_with_keys(SIPHASH_KEY.0, SIPHASH_KEY.1);
+        hasher.write(&cid[0..19]);
+        let hash = hasher.finish();
+        cid[19] = (hash & 0xFF) as u8;
 
         cid
     }
 
-    /// Generate a new Connection ID with a simple random prefix
+    /// Generate a new Connection ID with seeded randomness (for testing only)
     ///
-    /// This is a convenience method that generates a basic random-looking prefix.
-    /// For production use, consider using a cryptographically secure random generator.
+    /// This method uses a simple PRNG based on the seed for deterministic testing.
+    /// DO NOT use this in production - use `new()` instead.
     ///
     /// # Arguments
     /// * `generation` - Generation counter (0-31)
     /// * `worker_idx` - Worker/socket index (0-255)
-    /// * `prefix_seed` - A seed value to generate the prefix (for simplicity)
+    /// * `seed` - A seed value to generate deterministic entropy
     ///
     /// # Returns
-    /// An 8-byte array representing the Connection ID
-    pub fn new_with_seed(generation: u8, worker_idx: u8, prefix_seed: u32) -> [u8; CID_LENGTH] {
-        // Simple pseudo-random prefix generation (not cryptographically secure)
-        // In production, use a proper CSPRNG
-        let prefix = [
-            (prefix_seed >> 24) as u8,
-            (prefix_seed >> 16) as u8,
-            (prefix_seed >> 8) as u8,
-            prefix_seed as u8,
-            worker_idx.wrapping_mul(17).wrapping_add(generation),
-            generation.wrapping_mul(31).wrapping_add(worker_idx),
-        ];
+    /// A 20-byte array representing the Connection ID
+    pub fn new_with_seed(generation: u8, worker_idx: u8, seed: u32) -> [u8; CID_LENGTH] {
+        // Simple PRNG for testing (NOT cryptographically secure)
+        let mut entropy = [0u8; 17];
+        let mut state = seed;
+        
+        for i in 0..17 {
+            // Simple LCG: state = (a * state + c) mod m
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            entropy[i] = (state >> (8 * (i % 4))) as u8;
+        }
+        
+        Self::new_with_entropy(generation, worker_idx, entropy)
+    }
 
-        Self::generate(generation, worker_idx, prefix)
+    /// Verify the SipHash protection byte of a Connection ID
+    ///
+    /// # Arguments
+    /// * `cid` - The Connection ID to verify (must be exactly 20 bytes)
+    ///
+    /// # Returns
+    /// `true` if the protection byte is valid, `false` otherwise
+    pub fn verify_protection(cid: &[u8]) -> bool {
+        if cid.len() != CID_LENGTH {
+            return false;
+        }
+
+        let mut hasher = SipHasher13::new_with_keys(SIPHASH_KEY.0, SIPHASH_KEY.1);
+        hasher.write(&cid[0..19]);
+        let hash = hasher.finish();
+        let expected = (hash & 0xFF) as u8;
+        
+        cid[19] == expected
     }
 
     /// Extract the cookie from a Connection ID
@@ -246,6 +319,9 @@ impl ConnectionId {
     }
 
     /// Validate a Connection ID's cookie
+    ///
+    /// Note: This only validates the cookie checksum, not the SipHash protection byte.
+    /// For full validation, also call `verify_protection()`.
     ///
     /// # Arguments
     /// * `cid` - The Connection ID to validate
@@ -350,18 +426,21 @@ mod tests {
     fn test_connection_id_creation() {
         let generation = 3;
         let worker_idx = 17;
-        let prefix = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let entropy = [0xAAu8; 17];
 
-        let cid = ConnectionId::generate(generation, worker_idx, prefix);
+        let cid = ConnectionId::new_with_entropy(generation, worker_idx, entropy);
 
         // Check length
         assert_eq!(cid.len(), CID_LENGTH);
 
-        // Check prefix is preserved
-        assert_eq!(&cid[0..6], &prefix);
+        // Check prefix is preserved (first 6 bytes of entropy)
+        assert_eq!(&cid[0..6], &entropy[0..6]);
 
         // Validate cookie
         assert!(ConnectionId::validate_cookie(&cid));
+
+        // Verify SipHash protection
+        assert!(ConnectionId::verify_protection(&cid));
 
         // Extract components
         assert_eq!(ConnectionId::get_generation(&cid), Some(generation));
@@ -376,10 +455,20 @@ mod tests {
 
         let cid = ConnectionId::new_with_seed(generation, worker_idx, seed);
 
+        // Check length
+        assert_eq!(cid.len(), CID_LENGTH);
+
         // Validate
         assert!(ConnectionId::validate_cookie(&cid));
         assert_eq!(ConnectionId::get_generation(&cid), Some(generation));
         assert_eq!(ConnectionId::get_worker_idx(&cid), Some(worker_idx));
+        
+        // Verify SipHash protection
+        assert!(ConnectionId::verify_protection(&cid));
+        
+        // Deterministic: same seed should produce same CID
+        let cid2 = ConnectionId::new_with_seed(generation, worker_idx, seed);
+        assert_eq!(cid, cid2);
     }
 
     #[test]
@@ -390,6 +479,32 @@ mod tests {
         assert!(Cookie::validate(cookie));
         assert_eq!(Cookie::get_generation(cookie), 2);
         assert_eq!(Cookie::get_worker_idx(cookie), 50);
+        
+        // Also verify full CID
+        assert!(ConnectionId::verify_protection(&cid));
+    }
+
+    #[test]
+    fn test_connection_id_new() {
+        let generation = 5;
+        let worker_idx = 123;
+
+        let cid = ConnectionId::new(generation, worker_idx).unwrap();
+
+        // Check length
+        assert_eq!(cid.len(), CID_LENGTH);
+
+        // Validate cookie
+        assert!(ConnectionId::validate_cookie(&cid));
+        assert_eq!(ConnectionId::get_generation(&cid), Some(generation));
+        assert_eq!(ConnectionId::get_worker_idx(&cid), Some(worker_idx));
+        
+        // Verify SipHash protection
+        assert!(ConnectionId::verify_protection(&cid));
+        
+        // Each call should produce different CID (due to randomness)
+        let cid2 = ConnectionId::new(generation, worker_idx).unwrap();
+        assert_ne!(cid, cid2);
     }
 
     #[test]
@@ -445,6 +560,88 @@ mod tests {
         let invalid_cookie = cookie ^ 0x0001; // Corrupt checksum
         assert!(!is_valid_worker_cookie(invalid_cookie, generation));
     }
+
+    #[test]
+    fn test_siphash_protection() {
+        let generation = 2;
+        let worker_idx = 50;
+        let entropy = [0x42u8; 17];
+
+        let cid = ConnectionId::new_with_entropy(generation, worker_idx, entropy);
+
+        // Valid CID should verify
+        assert!(ConnectionId::verify_protection(&cid));
+
+        // Tampering with any byte (except last) should break protection
+        for i in 0..19 {
+            let mut tampered = cid;
+            tampered[i] ^= 0x01; // Flip one bit
+            assert!(
+                !ConnectionId::verify_protection(&tampered),
+                "Tampering at byte {} should break protection",
+                i
+            );
+        }
+
+        // Tampering with the protection byte itself
+        let mut tampered_protection = cid;
+        tampered_protection[19] ^= 0x01;
+        assert!(!ConnectionId::verify_protection(&tampered_protection));
+    }
+
+    #[test]
+    fn test_siphash_uniqueness() {
+        // Different inputs should produce different protection bytes
+        let entropy1 = [0x11u8; 17];
+        let entropy2 = [0x22u8; 17];
+
+        let cid1 = ConnectionId::new_with_entropy(0, 0, entropy1);
+        let cid2 = ConnectionId::new_with_entropy(0, 0, entropy2);
+
+        // The protection bytes should be different
+        assert_ne!(cid1[19], cid2[19]);
+    }
+
+    #[test]
+    fn test_entropy_distribution() {
+        // Verify that entropy is placed correctly
+        let entropy = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, // First 6 bytes -> prefix (0-5)
+            0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, // Next 11 bytes -> suffix (8-18)
+        ];
+
+        let cid = ConnectionId::new_with_entropy(0, 0, entropy);
+
+        // Check prefix (bytes 0-5)
+        assert_eq!(&cid[0..6], &entropy[0..6]);
+
+        // Bytes 6-7 are the cookie (not from entropy)
+        let cookie = u16::from_be_bytes([cid[6], cid[7]]);
+        assert_eq!(cookie, Cookie::generate(0, 0));
+
+        // Check suffix (bytes 8-18)
+        assert_eq!(&cid[8..19], &entropy[6..17]);
+
+        // Byte 19 is the protection byte (computed)
+        assert!(ConnectionId::verify_protection(&cid));
+    }
+
+    #[test]
+    fn test_backward_compatibility() {
+        // Ensure extract_cookie still works with 20-byte CIDs
+        let generation = 7;
+        let worker_idx = 99;
+        let cid = ConnectionId::new_with_seed(generation, worker_idx, 0xDEADBEEF);
+
+        // Old validation methods should still work
+        assert!(ConnectionId::validate_cookie(&cid));
+        assert_eq!(ConnectionId::get_generation(&cid), Some(generation));
+        assert_eq!(ConnectionId::get_worker_idx(&cid), Some(worker_idx));
+
+        let cookie = ConnectionId::extract_cookie(&cid).unwrap();
+        assert_eq!(Cookie::get_generation(cookie), generation);
+        assert_eq!(Cookie::get_worker_idx(cookie), worker_idx);
+    }
 }
 
 #[cfg(test)]
@@ -482,11 +679,11 @@ mod integration_tests {
         assert_eq!(Cookie::get_generation(cookie2), generation);
 
         // Test Connection ID creation with cookies
-        let prefix = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let entropy = [0xAAu8; 17];
 
-        let cid0 = ConnectionId::generate(generation, 0, prefix);
-        let cid1 = ConnectionId::generate(generation, 1, prefix);
-        let cid2 = ConnectionId::generate(generation, 2, prefix);
+        let cid0 = ConnectionId::new_with_entropy(generation, 0, entropy);
+        let cid1 = ConnectionId::new_with_entropy(generation, 1, entropy);
+        let cid2 = ConnectionId::new_with_entropy(generation, 2, entropy);
 
         // Verify cookies are embedded correctly
         assert_eq!(ConnectionId::extract_cookie(&cid0), Some(cookie0));
@@ -498,11 +695,13 @@ mod integration_tests {
         assert!(ConnectionId::validate_cookie(&cid2));
 
         // Test invalid cookie scenarios
-        let invalid_cid = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x01]; // Invalid cookie
+        let mut invalid_cid = [0xAAu8; 20];
+        invalid_cid[6] = 0x00; // Set invalid cookie at bytes 6-7
+        invalid_cid[7] = 0x01;
         assert!(!ConnectionId::validate_cookie(&invalid_cid));
 
         // Test load distribution for new connections (no valid cookie)
-        let new_connection_cid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]; // Random DCID
+        let new_connection_cid = [0x11u8; 20]; // Random DCID
         assert!(!ConnectionId::validate_cookie(&new_connection_cid));
 
         println!("eBPF cookie routing logic validation passed");
@@ -514,17 +713,17 @@ mod integration_tests {
 
         // Short header packet (1-RTT)
         let mut short_header_packet = vec![0x40]; // Short header flag
-        short_header_packet.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]); // 8-byte DCID
+        short_header_packet.extend_from_slice(&[0u8; 20]); // 20-byte DCID placeholder
         short_header_packet.extend_from_slice(&[0x99, 0xAA, 0xBB]); // Rest of packet
 
         // Create a Connection ID and embed it
         let generation = 1;
         let worker_idx = 42;
-        let cid =
-            ConnectionId::generate(generation, worker_idx, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        let entropy = [0x11u8; 17];
+        let cid = ConnectionId::new_with_entropy(generation, worker_idx, entropy);
 
         // Replace DCID in packet
-        short_header_packet[1..9].copy_from_slice(&cid);
+        short_header_packet[1..21].copy_from_slice(&cid);
 
         // Extract cookie from packet (simulate what eBPF does)
         let extracted_cookie = extract_cookie_from_packet(&short_header_packet);
@@ -558,9 +757,9 @@ mod integration_tests {
         // Test that the load distribution hash function works consistently
 
         let test_dcids = vec![
-            [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
-            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11],
-            [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0],
+            [0x11u8; 20],
+            [0xAAu8; 20],
+            [0x12u8; 20],
         ];
 
         // Test that the same DCID always produces the same hash
@@ -625,14 +824,14 @@ fn extract_cookie_from_packet(packet: &[u8]) -> Option<u16> {
     let first_byte = packet[0];
 
     if first_byte & 0x80 == 0 {
-        // Short header
-        if packet.len() < 9 {
+        // Short header - cookie at bytes 7-8 (offset 1 for header, then 6 bytes in)
+        if packet.len() < 21 {
             return None;
         }
         Some(u16::from_be_bytes([packet[7], packet[8]]))
     } else {
-        // Long header
-        if packet.len() < 14 {
+        // Long header - cookie at DCID bytes 6-7
+        if packet.len() < 26 {
             return None;
         }
         let dcid_start = 6; // flags(1) + version(4) + dcid_len(1)
@@ -644,7 +843,7 @@ fn extract_cookie_from_packet(packet: &[u8]) -> Option<u16> {
 }
 
 #[allow(dead_code)]
-fn compute_dcid_hash_simple(dcid: &[u8; 8]) -> u8 {
+fn compute_dcid_hash_simple(dcid: &[u8; 20]) -> u8 {
     // Simple hash for testing (matches eBPF logic)
     let mut hash: u32 = 0;
     for &byte in dcid {
