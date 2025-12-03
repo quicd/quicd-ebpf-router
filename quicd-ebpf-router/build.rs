@@ -21,6 +21,8 @@ fn main() -> anyhow::Result<()> {
             .parent()
             .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
             .as_str(),
+        features: &[],
+        no_default_features: true,
     };
     aya_build::build_ebpf([ebpf_package], Toolchain::default())
 }
